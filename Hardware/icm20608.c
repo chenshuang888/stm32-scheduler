@@ -2,6 +2,11 @@
 #include "scheduler.h"
 #include <math.h>
 
+/* 任务栈大小（单位：字）：本模块自定义，不依赖调度器
+   ICM_Task 栈深最大：I2C 读取链 + Madgwick 浮点 + 1Hz printf(%f)。
+   512 字 = 2 KB，已由栈高水位实测校准。 */
+#define ICM_STACK_SIZE    512
+
 /* bias 用 float 存储，支持 IIR 平滑更新 */
 static float gyro_bias_x = 0.0f, gyro_bias_y = 0.0f, gyro_bias_z = 0.0f;
 
@@ -79,6 +84,12 @@ uint8_t ICM_Init(void)
 
     HAL_Delay(100);
     ICM_CalibrateGyro();
+
+    /* 自注册任务：须在 scheduler_init() 之后、scheduler_start() 之前调用。
+       放在校准完成之后 —— 校准是阻塞式的（MSP 上跑），任务创建后
+       不会在调度器启动前被调度。 */
+    scheduler_task_create(ICM_Task, "ICM",
+                          TASK_PRIO_NORMAL, ICM_STACK_SIZE);
     return 1;
 }
 
@@ -264,7 +275,6 @@ void ICM_Task(void)
             float pitch = asinf (2.0f*(mw_q0*mw_q2 - mw_q3*mw_q1))        * 57.29578f;
             float yaw   = atan2f(2.0f*(mw_q1*mw_q2 + mw_q0*mw_q3),
                                  1.0f - 2.0f*(mw_q2*mw_q2 + mw_q3*mw_q3)) * 57.29578f;
-
             printf("R:%6.1f P:%6.1f Y:%6.1f  [%s]\r\n",
                    roll, pitch, yaw,
                    (static_count >= STATIC_CONFIRM) ? "ST" : "DY");

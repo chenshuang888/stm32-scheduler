@@ -829,6 +829,11 @@
               <FileType>1</FileType>
               <FilePath>..\Scheduler\port_timer.c</FilePath>
             </File>
+            <File>
+              <FileName>port_mem.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Scheduler\port_mem.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

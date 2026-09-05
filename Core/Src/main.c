@@ -23,6 +23,7 @@
 #include "gpio.h"
 #include "uart.h"
 #include "icm20608.h"
+#include "led.h"
 #include "scheduler.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -93,12 +94,18 @@ int main(void)
   MX_USART1_UART_Init();
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+  /* 必须先初始化调度器：Led_Init/ICM_Init/Uart_Init 内部会调用
+     scheduler_task_create() 从内存池分配内存，须保证池已就绪。
+     scheduler_init() 只建立内核兜底任务 IDLE，不会启动调度器。 */
+  scheduler_init();
+
+  /* 各模块自注册任务。注意：ICM_Init 内含约 3.3s 的阻塞式陀螺校准，
+     全部完成后才创建 ICM 任务；调度器尚未启动，此期间跑在 MSP 上。 */
+//  Led_Init();
   Uart_Init();
   ICM_Init();
   
   printf("Success\r\n");
-  
-  scheduler_init();
   /* USER CODE END 2 */
 
   /* 启动调度器（不会返回，各任务在自己的栈上以 while(1) 形式运行） */
