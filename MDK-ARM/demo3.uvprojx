@@ -834,6 +834,11 @@
               <FileType>1</FileType>
               <FilePath>..\Scheduler\port_mem.c</FilePath>
             </File>
+            <File>
+              <FileName>scheduler_queue.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Scheduler\scheduler_queue.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

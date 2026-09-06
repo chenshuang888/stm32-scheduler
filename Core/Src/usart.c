@@ -25,6 +25,7 @@
 /* USER CODE END 0 */
 
 UART_HandleTypeDef huart1;
+DMA_HandleTypeDef  hdma_usart1_tx;    /* USART1_TX，配置见 HAL_UART_MspInit() */
 
 /* USART1 init function */
 
@@ -84,6 +85,45 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     HAL_NVIC_SetPriority(USART1_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(USART1_IRQn);
   /* USER CODE BEGIN USART1_MspInit 1 */
+
+    /*----------------------------------------------------------------------
+     * USART1_TX 的 DMA 配置
+     *
+     * F407 的 DMA 请求映射是固定的：USART1_TX → DMA2_Stream7 / Channel 4。
+     * 必须在 HAL_UART_Transmit_DMA() 之前完成初始化并与 huart1 关联，
+     * 否则 huart1.hdmatx 为 NULL，启动发送会以 HAL_ERROR 失败。
+     *
+     * 发送完成链路（易误解，故记于此）：
+     *   DMA 传输完成中断 → HAL_DMA_IRQHandler → UART_DMATransmitCplt
+     *   → 打开 USART1 的 TC 中断 → HAL_UART_IRQHandler
+     *   → UART_EndTransmitIT → HAL_UART_TxCpltCallback
+     * 因此 DMA 中断与 USART1 全局中断两者都必须使能，缺一不会有完成回调。
+     *--------------------------------------------------------------------*/
+    __HAL_RCC_DMA2_CLK_ENABLE();
+
+    hdma_usart1_tx.Instance                 = DMA2_Stream7;
+    hdma_usart1_tx.Init.Channel             = DMA_CHANNEL_4;
+    hdma_usart1_tx.Init.Direction           = DMA_MEMORY_TO_PERIPH;
+    hdma_usart1_tx.Init.PeriphInc           = DMA_PINC_DISABLE;  /* 外设地址固定 &USART1->DR */
+    hdma_usart1_tx.Init.MemInc              = DMA_MINC_ENABLE;   /* 内存地址自增，逐字节取 */
+    hdma_usart1_tx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart1_tx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_usart1_tx.Init.Mode                = DMA_NORMAL;        /* 每次发送单独启动 */
+    hdma_usart1_tx.Init.Priority            = DMA_PRIORITY_LOW;
+    hdma_usart1_tx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+
+    if (HAL_DMA_Init(&hdma_usart1_tx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(uartHandle, hdmatx, hdma_usart1_tx);
+
+    /* 与 USART1 同为优先级 5：DMA 完成中断里只做回调分发，
+       不必抢占其它外设中断，也便于与 UART 的 TC 中断配合。
+       注意不要设成 0 —— 那会抢占包括时基在内的所有中断。 */
+    HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
 
   /* USER CODE END USART1_MspInit 1 */
   }

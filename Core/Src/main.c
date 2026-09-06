@@ -101,7 +101,7 @@ int main(void)
 
   /* 各模块自注册任务。注意：ICM_Init 内含约 3.3s 的阻塞式陀螺校准，
      全部完成后才创建 ICM 任务；调度器尚未启动，此期间跑在 MSP 上。 */
-//  Led_Init();
+  Led_Init();
   Uart_Init();
   ICM_Init();
   

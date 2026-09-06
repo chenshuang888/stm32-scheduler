@@ -1,5 +1,6 @@
 #include "icm20608.h"
 #include "scheduler.h"
+#include "uart.h"
 #include <math.h>
 
 /* 任务栈大小（单位：字）：本模块自定义，不依赖调度器
@@ -275,9 +276,12 @@ void ICM_Task(void)
             float pitch = asinf (2.0f*(mw_q0*mw_q2 - mw_q3*mw_q1))        * 57.29578f;
             float yaw   = atan2f(2.0f*(mw_q1*mw_q2 + mw_q0*mw_q3),
                                  1.0f - 2.0f*(mw_q2*mw_q2 + mw_q3*mw_q3)) * 57.29578f;
-            printf("R:%6.1f P:%6.1f Y:%6.1f  [%s]\r\n",
-                   roll, pitch, yaw,
-                   (static_count >= STATIC_CONFIRM) ? "ST" : "DY");
+            /* 任务里一律走异步通道：投递给 Uart_Send_Task 统一发送，
+               避免本任务在 printf 上阻塞约 3.5 ms（占 10 ms 周期的 1/3）。
+               ICM_Init() 中的校准打印仍在裸机阶段，保留 printf。 */
+            Uart_Printf("R:%6.1f P:%6.1f Y:%6.1f  [%s]\r\n",
+                        roll, pitch, yaw,
+                        (static_count >= STATIC_CONFIRM) ? "ST" : "DY");
         }
 
         scheduler_delay(10);
