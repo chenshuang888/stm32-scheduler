@@ -177,7 +177,12 @@ void SysTick_Handler(void)
   */
 void USART1_IRQHandler(void)
 {
-  HAL_UART_IRQHandler(&huart1);   /* 处理 UART 中断，触发 HAL_UART_RxCpltCallback */
+  HAL_UART_IRQHandler(&huart1);   /* 处理 DMA 发送完成等由 HAL 管辖的中断 */
+
+  /* IDLE（线路空闲）中断 HAL 不处理，必须自行检测与清除：
+     一帧数据接收完毕后，线路保持高电平一个完整帧时间即触发，
+     这是判断"不定长一帧收完了"的唯一手段。详见 uart.c。 */
+  Uart_IdleIrqHandler();
 }
 
 /* USER CODE BEGIN 1 */

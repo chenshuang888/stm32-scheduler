@@ -3,11 +3,15 @@
 
 #include "main.h"
 
-#define UART_TIMEOUT_MS  10
-
 void Uart_Init(void);
-void Uart_Task(void);        /* 接收任务：收帧 + 投递回显消息 */
+void Uart_Task(void);        /* 接收任务：阻塞等信号量，从 DMA 环形缓冲取帧 */
 void Uart_Send_Task(void);   /* 发送任务：消费日志队列，是串口输出的唯一出口 */
+
+/* IDLE 中断处理（由 USART1_IRQHandler 调用）
+ *
+ * HAL 不处理 IDLE 中断，故自行在 uart.c 实现、由中断入口转发。
+ * 内部只做"清标志 + 释放信号量"，绝不做耗时操作。 */
+void Uart_IdleIrqHandler(void);
 
 /*---------------------------------------------------------------------------
  * 异步打印：格式化后投递进日志队列，由 Uart_Send_Task 统一发送

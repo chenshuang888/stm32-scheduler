@@ -41,6 +41,10 @@ extern UART_HandleTypeDef huart1;
    HAL_UART_MspInit() 中初始化 —— 发送侧需要它由 uart.c 引用。 */
 extern DMA_HandleTypeDef hdma_usart1_tx;
 
+/* USART1_RX 的 DMA 句柄（DMA2_Stream2 / Channel 4，循环模式）
+   接收侧由 uart.c 用它启动循环接收，并读 NDTR 推算硬件写指针。 */
+extern DMA_HandleTypeDef hdma_usart1_rx;
+
 /* USER CODE END Private defines */
 
 void MX_USART1_UART_Init(void);

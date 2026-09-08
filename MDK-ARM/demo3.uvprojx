@@ -839,6 +839,11 @@
               <FileType>1</FileType>
               <FilePath>..\Scheduler\scheduler_queue.c</FilePath>
             </File>
+            <File>
+              <FileName>scheduler_sem.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Scheduler\scheduler_sem.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

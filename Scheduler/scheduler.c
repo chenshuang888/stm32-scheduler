@@ -91,6 +91,24 @@ static void blocked_list_remove(TCB_t *tcb)
         *pp = tcb->next;
 }
 
+/*---------------------------------------------------------------------------
+ * 唤醒一个阻塞任务（内部函数）
+ *
+ *   result : 唤醒原因，1 = 等到了 / 延时到，0 = 超时
+ *
+ * 把 wait_obj 置空是刻意的一步：它兼作"已唤醒"标记。
+ * 若之后 tick 又因超时扫到这个任务，会因 wait_obj == NULL 而不再重复唤醒
+ * （任务此时已不在阻塞链上，扫描本就碰不到它，置空是双保险）。
+ *--------------------------------------------------------------------------*/
+static void sched_wake(TCB_t *tcb, uint8_t result)
+{
+    blocked_list_remove(tcb);
+    tcb->wait_obj    = NULL;
+    tcb->wait_result = result;
+    tcb->state       = TASK_READY;
+    ready_list_insert(tcb);
+}
+
 /*===========================================================================
  * 内部函数
  *=========================================================================*/
@@ -320,6 +338,8 @@ TCB_t *scheduler_task_create(void (*func)(void), const char *name,
     tcb->delay_ticks = 0;
     tcb->name        = name;
     tcb->next        = NULL;
+    tcb->wait_obj    = NULL;      /* 无等待对象 = 延时阻塞语义 */
+    tcb->wait_result = 0;
 
     /* --- 4. 挂入就绪链 --- */
     ready_list_insert(tcb);
@@ -401,9 +421,14 @@ void scheduler_tick(void)
         {
             if (--p->delay_ticks == 0)
             {
-                blocked_list_remove(p);
-                p->state = TASK_READY;
-                ready_list_insert(p);
+                /* wait_obj 非空 → 这是"带超时的事件等待"，到点算超时（0）；
+                   否则是普通延时阻塞，到点是正常唤醒（1）。
+
+                   注意：事件等待且 delay_ticks == 0（永久等待）时，
+                   外层 if (p->delay_ticks > 0) 不成立，会被自然跳过 ——
+                   永久等待的任务只由 scheduler_wake_one() 唤醒，
+                   绝不会被 tick 误唤醒。 */
+                sched_wake(p, (p->wait_obj != NULL) ? 0U : 1U);
                 need = 1;
             }
         }
@@ -484,6 +509,89 @@ void scheduler_delay(uint32_t ms)
 
     SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
     __enable_irq();
+}
+
+/*---------------------------------------------------------------------------
+ * 事件阻塞：把当前任务登记为"等待 obj"并阻塞
+ *
+ * !! 自身不关中断 —— 调用者必须已经处于临界区内 !!
+ *
+ * 为什么"判断条件不满足"与"登记阻塞"必须在同一个临界区内：
+ *   这是经典的丢失唤醒（lost wakeup）问题。若两步之间中断被打开，
+ *   生产者可能已经放好数据并尝试唤醒，而本任务还没挂上阻塞链 ——
+ *   唤醒落空；随后本任务才阻塞，数据躺在队列里却再也不会有人来唤醒。
+ *   把两步关在同一段临界区内，这个窗口就被彻底堵死了。
+ *
+ *   timeout_ms = 0 → 永久等待（delay_ticks 为 0，tick 不会递减它）
+ *   timeout_ms > 0 → 限时等待，到期由 tick 以"超时"唤醒
+ *
+ * 任务被唤醒后，从本函数的返回处继续执行，读自己的
+ * current_tcb->wait_result 即可区分"等到了(1)"还是"超时(0)"。
+ *--------------------------------------------------------------------------*/
+void scheduler_wait_prepare(void *obj, uint32_t timeout_ms)
+{
+    /* 调度器尚未启动（current_tcb == NULL，PSP 未生效）：
+       无法阻塞，也不该置位 PendSV，直接返回。
+       调用方会看到 wait_result 仍为 0，自行按"没等到"处理。 */
+    if (current_tcb == NULL)
+        return;
+
+    current_tcb->wait_obj    = obj;
+    current_tcb->wait_result = 0;
+    current_tcb->delay_ticks = timeout_ms;
+    current_tcb->state       = TASK_BLOCKED;
+
+    /* 与 scheduler_delay() 同样处理：先从就绪链摘下，再挂进阻塞链，
+       保证任一时刻一个 TCB 只挂在一条链上（否则链表会成环）。 */
+    ready_list_remove(current_tcb);
+    blocked_list_insert(current_tcb);
+
+    /* 已主动进入 BLOCKED，切换是必然的，无需走 need_context_switch()。
+       PendSV 会等调用者开中断之后才真正执行。 */
+    SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
+}
+
+/*---------------------------------------------------------------------------
+ * 事件唤醒：唤醒等待 obj 的优先级最高的那个任务
+ *
+ * !! 自身不关中断 —— 调用者必须已经处于临界区内 !!
+ *    在 ISR 中调用时，同样建议在调用前后自行关中断。
+ *
+ * obj 通常就是队列控制块指针 —— 不必为"等待对象"引入新的结构体。
+ *
+ * 只唤醒一个：一条消息 / 一个令牌只应有一个接收者拿到。
+ * 阻塞链通常只有 1~3 个任务，线性扫描找最高优先级者的开销可忽略，
+ * 比给每个队列单独维护一条等待链（TCB 要再加一个链表指针）划算得多。
+ *
+ * 返回：1 = 唤醒了一个任务；0 = 没人在等 obj。
+ *   信号量需要这个返回值 —— give 时若已把令牌过继给等待者，
+ *   就不能再累加计数值，否则同一个令牌会被算两次。
+ *--------------------------------------------------------------------------*/
+uint8_t scheduler_wake_one(void *obj)
+{
+    TCB_t *p;
+    TCB_t *best = NULL;
+
+    if (obj == NULL)
+        return 0;
+
+    for (p = blocked_head; p != NULL; p = p->next)
+    {
+        if (p->wait_obj == obj && (best == NULL || p->prio < best->prio))
+            best = p;
+    }
+
+    if (best == NULL)
+        return 0;                       /* 没有任务在等这个对象 */
+
+    sched_wake(best, 1);
+
+    /* 被唤醒者优先级更高 → 抢占。
+       同优先级不抢占，遵循"跨优先级抢占、同优先级协作"的既有策略。 */
+    if (current_tcb != NULL && best->prio < current_tcb->prio)
+        SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
+
+    return 1;
 }
 
 /*---------------------------------------------------------------------------

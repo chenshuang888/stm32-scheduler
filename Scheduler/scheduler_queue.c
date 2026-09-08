@@ -1,4 +1,5 @@
 #include "scheduler_queue.h"
+#include "scheduler.h"
 #include "port_mem.h"
 #include <string.h>
 
@@ -20,36 +21,25 @@
  * 用 count 而不是"（tail+1)%cap==head 留一格"的经典判据：
  * 多占一个字节变量，换来空/满判断的一目了然，也免去了 capacity 语义
  * （"实际能装 capacity-1 条"）带来的误解。
- *=========================================================================*/
-
-/*---------------------------------------------------------------------------
- * 临界区：保存/恢复 PRIMASK
  *
- * 为什么不是裸的 __disable_irq() / __enable_irq()：
- *   裸 __enable_irq() 会无条件开中断。若调用者本身已在临界区内（例如将来
- *   在内核的关中断路径里入队），返回时会被本模块提前打开，破坏外层保护。
- *   保存 PRIMASK 再按原值恢复，就自然支持嵌套。
+ * ---------------------------------------------------------------------------
+ * 临界区：一律裸 __disable_irq() / __enable_irq()
  *
- *   __get_PRIMASK() 返回 0 表示进临界区前中断是开的（由本模块负责重开），
- *   返回 1 表示原本就关着（本模块不动，交给外层）。
+ * 之所以不封装成"保存/恢复 PRIMASK"的形式：那种写法是为了支持"临界区里
+ * 再调用一个自带临界区的函数"（嵌套）。而嵌套临界区本身就是代码异味，
+ * 本模块通过约定彻底避免它 —— 凡是内核提供的 wait_/wake_ 系列函数都不
+ * 自己关中断，由调用者统一持锁。于是全工程只有一层临界区，
+ * 裸开关就足够，不需要任何包装。
  *
- * 为什么足以保护队列：
+ * 为什么关中断足以保护队列：
  *   head/tail/count 的并发只可能来自"任务 vs 中断"。关中断后同优先级任务
- *   不会抢占、中断也不会插入，读改写序列天然原子。这也是本模块暂时不需要
- *   调度器提供正式临界区 API 的原因。
- *-------------------------------------------------------------------------*/
-static uint32_t q_lock(void)
-{
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    return primask;
-}
-
-static void q_unlock(uint32_t primask)
-{
-    if (primask == 0U)
-        __enable_irq();
-}
+ *   不会抢占、中断也不会插入，读改写序列天然原子。
+ *
+ * !! 临界区内禁止的事 !!
+ *   1. 不做耗时操作（vsnprintf、大块拷贝）—— 关中断太久会丢时基 tick
+ *   2. 不调用 scheduler_delay() 等会阻塞的接口
+ *   3. 临界区不能跨越阻塞点，否则保护就断了
+ *=========================================================================*/
 
 /* 索引推进：不用 % 取模，避免引入除法指令 */
 static uint16_t q_next(sched_queue_t *q, uint16_t idx)
@@ -76,7 +66,6 @@ sched_queue_t *scheduler_queue_create(uint16_t item_size, uint16_t capacity)
     uint8_t       *buf;
     uint32_t       aligned;
     uint32_t       total;
-    uint32_t       primask;
 
     if (item_size == 0U || capacity == 0U)
         return NULL;
@@ -95,19 +84,19 @@ sched_queue_t *scheduler_queue_create(uint16_t item_size, uint16_t capacity)
 
     total = (uint32_t)capacity * aligned;
 
-    primask = q_lock();
+    __disable_irq();
 
     buf = (uint8_t *)scheduler_port_mem_alloc(total);
     if (buf == NULL)
     {
-        q_unlock(primask);
+        __enable_irq();
         return NULL;
     }
 
     q = (sched_queue_t *)scheduler_port_mem_alloc(sizeof(sched_queue_t));
     if (q == NULL)
     {
-        q_unlock(primask);
+        __enable_irq();
         return NULL;                       /* 存储区已泄漏，但池本就不支持回收 */
     }
 
@@ -118,27 +107,29 @@ sched_queue_t *scheduler_queue_create(uint16_t item_size, uint16_t capacity)
     q->tail      = 0U;
     q->count     = 0U;
 
-    q_unlock(primask);
+    __enable_irq();
 
     return q;
 }
 
 /*---------------------------------------------------------------------------
  * 入队
+ *
+ * 放入数据后立刻尝试唤醒一个等待者 —— 唤醒动作必须在临界区内完成，
+ * 否则"放入"与"唤醒"之间若被 tick 插入，可能把刚唤醒的任务又误判为超时。
  *--------------------------------------------------------------------------*/
 int scheduler_queue_send(sched_queue_t *q, const void *item)
 {
-    uint32_t primask;
     uint8_t *dst;
 
     if (q == NULL || q->buf == NULL || item == NULL)
         return 0;
 
-    primask = q_lock();
+    __disable_irq();
 
     if (q->count >= q->capacity)           /* 满：丢弃新消息 */
     {
-        q_unlock(primask);
+        __enable_irq();
         return 0;
     }
 
@@ -148,27 +139,28 @@ int scheduler_queue_send(sched_queue_t *q, const void *item)
     q->tail  = q_next(q, q->tail);
     q->count = (uint16_t)(q->count + 1U);
 
-    q_unlock(primask);
+    scheduler_wake_one(q);                 /* 队列自身即"等待对象" */
+
+    __enable_irq();
 
     return 1;
 }
 
 /*---------------------------------------------------------------------------
- * 出队
+ * 出队（非阻塞）
  *--------------------------------------------------------------------------*/
 int scheduler_queue_recv(sched_queue_t *q, void *item)
 {
-    uint32_t       primask;
     const uint8_t *src;
 
     if (q == NULL || q->buf == NULL || item == NULL)
         return 0;
 
-    primask = q_lock();
+    __disable_irq();
 
     if (q->count == 0U)                    /* 空：非阻塞，立即返回 */
     {
-        q_unlock(primask);
+        __enable_irq();
         return 0;
     }
 
@@ -178,9 +170,64 @@ int scheduler_queue_recv(sched_queue_t *q, void *item)
     q->head  = q_next(q, q->head);
     q->count = (uint16_t)(q->count - 1U);
 
-    q_unlock(primask);
+    __enable_irq();
 
     return 1;
+}
+
+/*---------------------------------------------------------------------------
+ * 出队（阻塞等待）
+ *
+ *   timeout_ms = 0 → 永久等待，直到有消息入队
+ *   timeout_ms > 0 → 限时等待，到期返回 0
+ *
+ * 返回：1 取到消息；0 超时（或调度器未启动、参数非法）
+ *
+ * 为什么整体是 for(;;) 循环：
+ *   被唤醒只代表"曾经有人往队列里放过东西"，不代表这一条还在 ——
+ *   若有多个消费者，可能被别人先取走。所以醒来后必须重新判断，
+ *   取不到就继续等。
+ *
+ * 为什么"判空"与"登记阻塞"必须在同一个临界区内：
+ *   见 scheduler_wait_prepare() 的注释（丢失唤醒问题）。
+ *   注意下面取消息的代码是内联写的，而不是调用 scheduler_queue_recv()——
+ *   就是为了不出现"临界区里再进一次临界区"的嵌套。
+ *--------------------------------------------------------------------------*/
+int scheduler_queue_recv_block(sched_queue_t *q, void *item, uint32_t timeout_ms)
+{
+    if (q == NULL || q->buf == NULL || item == NULL)
+        return 0;
+
+    for (;;)
+    {
+        __disable_irq();
+
+        if (q->count > 0U)
+        {
+            const uint8_t *src = q->buf + (uint32_t)q->head * q->item_size;
+            memcpy(item, src, q->item_size);
+            q->head  = q_next(q, q->head);
+            q->count = (uint16_t)(q->count - 1U);
+            __enable_irq();
+            return 1;
+        }
+
+        /* 调度器尚未启动：无法阻塞，退化成非阻塞语义 */
+        if (current_tcb == NULL)
+        {
+            __enable_irq();
+            return 0;
+        }
+
+        scheduler_wait_prepare(q, timeout_ms);
+        __enable_irq();
+
+        /* ===== 任务在此挂起；被唤醒后从下一行继续 ===== */
+        if (current_tcb->wait_result == 0U)
+            return 0;                      /* 超时 */
+
+        /* 被唤醒：回到循环顶部重新取（可能已被别的消费者取走） */
+    }
 }
 
 /*---------------------------------------------------------------------------
@@ -188,24 +235,23 @@ int scheduler_queue_recv(sched_queue_t *q, void *item)
  *--------------------------------------------------------------------------*/
 int scheduler_queue_peek(sched_queue_t *q, void *item)
 {
-    uint32_t       primask;
     const uint8_t *src;
 
     if (q == NULL || q->buf == NULL || item == NULL)
         return 0;
 
-    primask = q_lock();
+    __disable_irq();
 
     if (q->count == 0U)
     {
-        q_unlock(primask);
+        __enable_irq();
         return 0;
     }
 
     src = q->buf + (uint32_t)q->head * q->item_size;
     memcpy(item, src, q->item_size);
 
-    q_unlock(primask);
+    __enable_irq();
 
     return 1;
 }
@@ -220,30 +266,28 @@ int scheduler_queue_peek(sched_queue_t *q, void *item)
  *--------------------------------------------------------------------------*/
 uint16_t scheduler_queue_count(const sched_queue_t *q)
 {
-    uint32_t primask;
     uint16_t n;
 
     if (q == NULL)
         return 0;
 
-    primask = q_lock();
+    __disable_irq();
     n = q->count;
-    q_unlock(primask);
+    __enable_irq();
 
     return n;
 }
 
 uint16_t scheduler_queue_space(const sched_queue_t *q)
 {
-    uint32_t primask;
     uint16_t n;
 
     if (q == NULL)
         return 0;
 
-    primask = q_lock();
+    __disable_irq();
     n = (uint16_t)(q->capacity - q->count);
-    q_unlock(primask);
+    __enable_irq();
 
     return n;
 }
@@ -253,14 +297,12 @@ uint16_t scheduler_queue_space(const sched_queue_t *q)
  *--------------------------------------------------------------------------*/
 void scheduler_queue_reset(sched_queue_t *q)
 {
-    uint32_t primask;
-
     if (q == NULL)
         return;
 
-    primask = q_lock();
+    __disable_irq();
     q->head  = 0U;
     q->tail  = 0U;
     q->count = 0U;
-    q_unlock(primask);
+    __enable_irq();
 }

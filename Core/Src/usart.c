@@ -26,6 +26,7 @@
 
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef  hdma_usart1_tx;    /* USART1_TX，配置见 HAL_UART_MspInit() */
+DMA_HandleTypeDef  hdma_usart1_rx;    /* USART1_RX，配置见 HAL_UART_MspInit() */
 
 /* USART1 init function */
 
@@ -124,6 +125,41 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
        注意不要设成 0 —— 那会抢占包括时基在内的所有中断。 */
     HAL_NVIC_SetPriority(DMA2_Stream7_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(DMA2_Stream7_IRQn);
+
+    /*----------------------------------------------------------------------
+     * USART1_RX 的 DMA 配置（DMA2_Stream2 / Channel 4，循环模式）
+     *
+     * 为什么用循环模式：串口帧是**不定长**的，无法预知一次要收多少字节。
+     * 循环模式下 DMA 永不停歇地把收到的字节填进缓冲、到尾自动绕回，
+     * 硬件独自搬运，完全不占 CPU，也不会因软件来不及取而丢数据（除非
+     * 缓冲被绕圈覆盖）。
+     *
+     * 循环模式下 DMA **不会产生"传输完成"中断**（它一直在传），
+     * 判断"一帧收完了"要靠 USART 的 IDLE 中断 —— 见 uart.c。
+     *
+     * 这里刻意不使能 DMA2_Stream2 的 NVIC：
+     *   HAL_UART_Receive_DMA() 内部会打开 DMA 的 HT/TC 中断标志，
+     *   但循环模式下这些中断对"判断帧结束"毫无意义（只表示绕圈了），
+     *   不开 NVIC 就不会产生中断，省得白白进出 ISR。
+     *   真正需要的 IDLE 中断由 uart.c 在 USART1 侧使能。
+     *--------------------------------------------------------------------*/
+    hdma_usart1_rx.Instance                 = DMA2_Stream2;
+    hdma_usart1_rx.Init.Channel             = DMA_CHANNEL_4;
+    hdma_usart1_rx.Init.Direction           = DMA_PERIPH_TO_MEMORY;
+    hdma_usart1_rx.Init.PeriphInc           = DMA_PINC_DISABLE;  /* 外设地址固定 &USART1->DR */
+    hdma_usart1_rx.Init.MemInc              = DMA_MINC_ENABLE;   /* 内存地址自增，逐字节存 */
+    hdma_usart1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+    hdma_usart1_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
+    hdma_usart1_rx.Init.Mode                = DMA_CIRCULAR;      /* 永不停歇，到尾绕回 */
+    hdma_usart1_rx.Init.Priority            = DMA_PRIORITY_LOW;
+    hdma_usart1_rx.Init.FIFOMode            = DMA_FIFOMODE_DISABLE;
+
+    if (HAL_DMA_Init(&hdma_usart1_rx) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(uartHandle, hdmarx, hdma_usart1_rx);
 
   /* USER CODE END USART1_MspInit 1 */
   }

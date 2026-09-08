@@ -105,6 +105,25 @@ typedef struct TCB {
     uint32_t     delay_ticks;
     const char  *name;
     struct TCB  *next;           /* 就绪链 / 阻塞链，单向               */
+
+    /*-------------------------------------------------------------------
+     * 事件阻塞（配合 scheduler_wait_prepare / scheduler_wake_one 使用）
+     *
+     *   wait_obj == NULL → 延时阻塞，由 tick 递减 delay_ticks 唤醒
+     *                      （scheduler_delay() 的现有语义，不变）
+     *   wait_obj != NULL → 事件阻塞，等待某个内核对象（如队列）
+     *                      delay_ticks = 0 永久等待
+     *                      delay_ticks > 0 限时等待，到期算超时
+     *
+     * wait_result 记录唤醒原因：1 = 等到了，0 = 超时。
+     * 任务被唤醒后从 scheduler_wait_prepare() 的调用点继续，
+     * 读自己的 wait_result 即可区分两种情况。
+     *
+     * wait_obj 被唤醒时置空，兼作"已唤醒"标记，
+     * 防止超时与事件两次唤醒同一个任务。
+     *------------------------------------------------------------------*/
+    void        *wait_obj;
+    uint8_t      wait_result;
 } TCB_t;
 
 /*---------------------------------------------------------------------------
@@ -140,6 +159,41 @@ TCB_t   *scheduler_task_create(void (*func)(void), const char *name,
 /* 查询指定任务"从未使用过"的栈空间（单位：字）。
    handle 为创建任务时返回的句柄；0 表示该任务已把栈用到栈底（溢出）。 */
 uint32_t scheduler_stack_free(TCB_t *handle);
+
+/*---------------------------------------------------------------------------
+ * 事件阻塞与唤醒（供队列等 IPC 原语使用）
+ *
+ * !! 这两个函数自身不关中断，调用者必须已经处于临界区内 !!
+ *
+ *   这样全工程只存在一层临界区，不会出现"临界区里又关一次中断"的嵌套，
+ *   也就不需要保存/恢复 PRIMASK 那套东西。
+ *
+ *   scheduler_wait_prepare(obj, timeout_ms)
+ *       把当前任务登记为"等待 obj"，移入阻塞链，并置位 PendSV
+ *       （开中断后立即切走）。timeout_ms = 0 表示永久等待。
+ *       任务被唤醒后从本函数的调用点继续执行。
+ *       调度器尚未启动（current_tcb == NULL）时直接返回，不做任何事。
+ *
+ *   scheduler_wake_one(obj)
+ *       唤醒等待 obj 的优先级最高的那个任务；
+ *       若它优先级高于当前任务，置位 PendSV 触发抢占。
+ *       返回 1 = 确实唤醒了一个任务；0 = 没有任何任务在等待 obj。
+ *
+ *       返回值供信号量使用：give 时若已把令牌直接过继给等待者，
+ *       就不该再累加计数值（否则令牌会被重复计算）。
+ *
+ * 典型用法（消费者侧，注意判空与阻塞必须在同一个临界区内，
+ * 否则会丢唤醒）：
+ *
+ *     __disable_irq();
+ *     if (queue_not_empty(q)) { 取一条; __enable_irq(); return 1; }
+ *     scheduler_wait_prepare(q, timeout);
+ *     __enable_irq();
+ *     if (current_tcb->wait_result == 0) return 0;   // 超时
+ *     // 被唤醒，重新尝试
+ *--------------------------------------------------------------------------*/
+void    scheduler_wait_prepare(void *obj, uint32_t timeout_ms);
+uint8_t scheduler_wake_one(void *obj);
 
 /*---------------------------------------------------------------------------
  * 供 port_asm.s 访问
